@@ -1,0 +1,1496 @@
+--
+-- PostgreSQL database dump
+--
+
+-- Dumped from database version 17.6 (Homebrew)
+-- Dumped by pg_dump version 17.0
+
+-- Started on 2026-01-21 09:06:16 PST
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET transaction_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- TOC entry 248 (class 1255 OID 26552)
+-- Name: assign_role_permission(integer, text, text); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.assign_role_permission(p_role_id integer, p_action_name text, p_resource_name text) RETURNS TABLE(success boolean, message text, role_name text, action_name text, resource_name text, formatted_permission text)
+    LANGUAGE plpgsql ROWS 1
+    AS $$
+DECLARE
+    v_role_name text;
+    v_action_id integer;
+    v_resource_id integer;
+    v_permission_id integer;
+    v_existing_count integer;
+BEGIN
+    -- Check if role exists and get its name
+    SELECT name INTO v_role_name FROM roles WHERE id = p_role_id;
+    IF v_role_name IS NULL THEN
+        RETURN QUERY SELECT 
+            false::boolean AS success,
+            ('Role with ID "' || p_role_id || '" does not exist')::text AS message,
+            NULL::text AS role_name,
+            p_action_name AS action_name,
+            p_resource_name AS resource_name,
+            NULL::text AS formatted_permission;
+        RETURN;
+    END IF;
+
+    -- Check if action exists and get its ID
+    SELECT id INTO v_action_id FROM actions WHERE name = p_action_name;
+    IF v_action_id IS NULL THEN
+        RETURN QUERY SELECT 
+            false::boolean AS success,
+            ('Action "' || p_action_name || '" does not exist')::text AS message,
+            v_role_name AS role_name,
+            p_action_name AS action_name,
+            p_resource_name AS resource_name,
+            NULL::text AS formatted_permission;
+        RETURN;
+    END IF;
+
+    -- Check if resource exists and get its ID
+    SELECT id INTO v_resource_id FROM resources WHERE name = p_resource_name;
+    IF v_resource_id IS NULL THEN
+        RETURN QUERY SELECT 
+            false::boolean AS success,
+            ('Resource "' || p_resource_name || '" does not exist')::text AS message,
+            v_role_name AS role_name,
+            p_action_name AS action_name,
+            p_resource_name AS resource_name,
+            NULL::text AS formatted_permission;
+        RETURN;
+    END IF;
+
+    -- Check if permission (action-resource relationship) exists, get its ID
+    SELECT id INTO v_permission_id 
+    FROM permissions 
+    WHERE resource_id = v_resource_id 
+    AND action_id = v_action_id;
+    
+    IF v_permission_id IS NULL THEN
+        -- Create permission (action-resource relationship) first
+        INSERT INTO permissions (resource_id, action_id)
+        VALUES (v_resource_id, v_action_id)
+        RETURNING id INTO v_permission_id;
+    END IF;
+
+    -- Check if role-permission relationship already exists
+    SELECT COUNT(*) INTO v_existing_count 
+    FROM role_permissions 
+    WHERE role_id = p_role_id 
+    AND permission_id = v_permission_id;
+    
+    IF v_existing_count > 0 THEN
+        RETURN QUERY SELECT 
+            false::boolean AS success,
+            ('Action "' || p_action_name || '" on resource "' || p_resource_name || '" is already assigned to role "' || v_role_name || '"')::text AS message,
+            v_role_name AS role_name,
+            p_action_name AS action_name,
+            p_resource_name AS resource_name,
+            (p_action_name || ':' || p_resource_name)::text AS formatted_permission;
+        RETURN;
+    END IF;
+
+    -- Assign permission to role
+    INSERT INTO role_permissions (role_id, permission_id)
+    VALUES (p_role_id, v_permission_id);
+
+    -- Return success
+    RETURN QUERY SELECT 
+        true::boolean AS success,
+        ('Action "' || p_action_name || '" on resource "' || p_resource_name || '" successfully assigned to role "' || v_role_name || '"')::text AS message,
+        v_role_name AS role_name,
+        p_action_name AS action_name,
+        p_resource_name AS resource_name,
+        (p_action_name || ':' || p_resource_name)::text AS formatted_permission;
+END;
+$$;
+
+
+ALTER FUNCTION public.assign_role_permission(p_role_id integer, p_action_name text, p_resource_name text) OWNER TO postgres;
+
+--
+-- TOC entry 255 (class 1255 OID 26600)
+-- Name: get_all_roles_permissions(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.get_all_roles_permissions() RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    v_result jsonb;
+BEGIN
+    WITH role_perms AS (
+        SELECT
+            r.id,
+            r.name AS role_name,
+            COALESCE(
+                jsonb_agg(
+                    jsonb_build_object(
+                        'resource', res.name,
+                        'action', a.name,
+                        'formatted', a.name || ':' || res.name
+                    )
+                ) FILTER (WHERE res.name IS NOT NULL AND a.name IS NOT NULL),
+                '[]'::jsonb
+            ) AS permissions
+        FROM roles r
+        LEFT JOIN role_permissions rp ON r.id = rp.role_id
+        LEFT JOIN permissions p ON rp.permission_id = p.id
+        LEFT JOIN actions a ON p.action_id = a.id
+        LEFT JOIN resources res ON p.resource_id = res.id
+        GROUP BY r.id, r.name
+    )
+    SELECT jsonb_agg(
+        jsonb_build_object(
+            'role', rp.role_name,
+            'permissions', rp.permissions
+        )
+        ORDER BY rp.role_name
+    ) INTO v_result
+    FROM role_perms rp;
+    
+    RETURN COALESCE(v_result, '[]'::jsonb);
+END;
+$$;
+
+
+ALTER FUNCTION public.get_all_roles_permissions() OWNER TO postgres;
+
+--
+-- TOC entry 253 (class 1255 OID 26601)
+-- Name: get_all_roles_permissions_json(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.get_all_roles_permissions_json() RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    v_result jsonb;
+BEGIN
+    WITH role_perms AS (
+        SELECT 
+            r.id,
+            r.name as role_name,
+            jsonb_agg(
+                jsonb_build_object(
+                    'resource', res.name,
+                    'action', a.name,
+                    'formatted', CONCAT(a.name, ':', res.name)
+                )
+                ORDER BY res.name, a.name
+            ) FILTER (WHERE res.name IS NOT NULL AND a.name IS NOT NULL) as permissions
+        FROM roles r
+        LEFT JOIN role_permissions rp ON r.id = rp.role_id
+        LEFT JOIN permissions p ON rp.permission_id = p.id
+        LEFT JOIN actions a ON p.action_id = a.id
+        LEFT JOIN resources res ON p.resource_id = res.id
+        GROUP BY r.id, r.name
+    )
+    SELECT jsonb_agg(
+        jsonb_build_object(
+            'role', rp.role_name,
+            'permissions', COALESCE(rp.permissions, '[]'::jsonb)
+        )
+        ORDER BY rp.role_name
+    ) INTO v_result
+    FROM role_perms rp;
+    
+    RETURN COALESCE(v_result, '[]'::jsonb);
+END;
+$$;
+
+
+ALTER FUNCTION public.get_all_roles_permissions_json() OWNER TO postgres;
+
+--
+-- TOC entry 254 (class 1255 OID 35473)
+-- Name: get_branches(character varying); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.get_branches(p_insti_code character varying) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    result JSONB;
+BEGIN
+    SELECT jsonb_agg(
+        jsonb_build_object(
+            'branch_code', branch_code,
+            'branch_name', branch_name
+        )
+    )
+    INTO result
+    FROM (
+        SELECT DISTINCT branch_code, branch_name
+        FROM offices
+        WHERE insti_code = p_insti_code
+        ORDER BY branch_code
+    ) AS distinct_branches;
+    
+    -- Return empty array if no results
+    RETURN COALESCE(result, '[]'::JSONB);
+END;
+$$;
+
+
+ALTER FUNCTION public.get_branches(p_insti_code character varying) OWNER TO postgres;
+
+--
+-- TOC entry 236 (class 1255 OID 26554)
+-- Name: get_role_permissions(integer); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.get_role_permissions(p_role_id integer) RETURNS TABLE(role text, resource text, action text, formatted_permission text)
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        r.name::TEXT AS role,
+        res.name::TEXT AS resource,
+        a.name::TEXT AS action,
+        CONCAT(a.name, ':', res.name)::TEXT AS formatted_permission
+    FROM roles r
+    INNER JOIN role_permissions rp ON r.id = rp.role_id
+    INNER JOIN permissions p ON rp.permission_id = p.id
+    INNER JOIN actions a ON p.action_id = a.id
+    INNER JOIN resources res ON p.resource_id = res.id
+    WHERE r.id = p_role_id
+    ORDER BY res.name, a.name;
+END;
+$$;
+
+
+ALTER FUNCTION public.get_role_permissions(p_role_id integer) OWNER TO postgres;
+
+--
+-- TOC entry 251 (class 1255 OID 26599)
+-- Name: get_role_permissions_json(integer); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.get_role_permissions_json(p_role_id integer) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    v_role_name text;
+    v_permissions_json jsonb;
+BEGIN
+    -- Get role name
+    SELECT name INTO v_role_name 
+    FROM roles 
+    WHERE id = p_role_id;
+    
+    -- Raise if role not found
+    IF v_role_name IS NULL THEN
+        RAISE EXCEPTION 'Role with ID % not found', p_role_id;
+    END IF;
+    
+    -- Get permissions
+    SELECT jsonb_agg(
+        jsonb_build_object(
+            'resource', res.name,
+            'action', a.name,
+            'formatted', CONCAT(a.name, ':', res.name)
+        )
+        ORDER BY res.name, a.name
+    ) INTO v_permissions_json
+    FROM role_permissions rp
+    JOIN permissions p ON rp.permission_id = p.id
+    JOIN actions a ON p.action_id = a.id
+    JOIN resources res ON p.resource_id = res.id
+    WHERE rp.role_id = p_role_id;
+    
+    -- Return result
+    RETURN jsonb_build_object(
+        'role', v_role_name,
+        'permissions', COALESCE(v_permissions_json, '[]'::jsonb)
+    );
+END;
+$$;
+
+
+ALTER FUNCTION public.get_role_permissions_json(p_role_id integer) OWNER TO postgres;
+
+--
+-- TOC entry 233 (class 1255 OID 35474)
+-- Name: get_units(character varying); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.get_units(p_branch_code character varying) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    result JSONB;
+BEGIN
+    SELECT jsonb_agg(
+        jsonb_build_object(
+            'unit_code', unit_code,
+            'unit_name', unit_name
+        )
+    )
+    INTO result
+    FROM (
+        SELECT DISTINCT unit_code, unit_name
+        FROM offices
+        WHERE branch_code = p_branch_code
+        ORDER BY unit_code
+    ) AS distinct_units;
+    
+    -- Return empty array if no results
+    RETURN COALESCE(result, '[]'::JSONB);
+END;
+$$;
+
+
+ALTER FUNCTION public.get_units(p_branch_code character varying) OWNER TO postgres;
+
+--
+-- TOC entry 250 (class 1255 OID 26561)
+-- Name: get_user_by_username(text); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.get_user_by_username(p_username text) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    v_result JSONB;
+BEGIN
+    SELECT jsonb_build_object(
+        'id', u.id,
+        'username', u.username,
+        'staff_id', u.staff_id,
+        'first_name', u.first_name,
+        'middle_name', u.middle_name,
+        'last_name', u.last_name,
+        'email', u.email,
+        'role_id', u.role_id,
+        'role_name', r.name,
+        'permissions', COALESCE(
+            (
+                SELECT ARRAY_AGG(DISTINCT CONCAT(a.name, ':', res.name) ORDER BY CONCAT(a.name, ':', res.name))
+                FROM role_permissions rp
+                JOIN permissions p ON rp.permission_id = p.id
+                JOIN actions a ON p.action_id = a.id
+                JOIN resources res ON p.resource_id = res.id
+                WHERE rp.role_id = u.role_id
+            ),
+            ARRAY[]::TEXT[]
+        )
+    ) INTO v_result
+    FROM users u
+    LEFT JOIN roles r ON u.role_id = r.id
+    WHERE u.username = p_username;
+    
+    RETURN v_result;
+END;
+$$;
+
+
+ALTER FUNCTION public.get_user_by_username(p_username text) OWNER TO postgres;
+
+--
+-- TOC entry 249 (class 1255 OID 25195)
+-- Name: register_user(jsonb); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.register_user(p_data jsonb) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    v_result jsonb;
+    v_user_id integer;
+BEGIN
+    -- Insert user into the users table
+    INSERT INTO users (
+        username,
+        staff_id,
+        first_name,
+        middle_name,
+        last_name,
+        email,
+        phone_no,
+        birthdate,
+        institution_code,
+        institution_id,
+		institution_name,
+        created_at,
+        updated_at,
+        password
+    )
+    VALUES (
+        p_data->>'username',
+        p_data->>'staff_id',
+        p_data->>'first_name',
+        p_data->>'middle_name',
+        p_data->>'last_name',
+        p_data->>'email',
+        p_data->>'phone_no',
+        (p_data->>'birthdate')::timestamp,
+        p_data->>'institution_code',
+        (p_data->>'institution_id')::int,
+		p_data->>'institution_name',
+        NOW(),
+        NOW(),
+        p_data->>'password'
+    )
+    RETURNING id INTO v_user_id;
+
+    -- Build and return JSONB matching RegisterStaffResult struct
+    SELECT jsonb_build_object(
+        'user_id', v_user_id,
+        'username', p_data->>'username',
+        'staff_id', p_data->>'staff_id',
+        'first_name', p_data->>'first_name',
+        'middle_name', p_data->>'middle_name',
+        'last_name', p_data->>'last_name',
+        'email', p_data->>'email',
+        'phone_no', p_data->>'phone_no',
+        'birthdate', p_data->>'birthdate',
+        'institution_code', p_data->>'institution_code',
+        'institution_id', (p_data->>'institution_id')::int,
+        'institution_name', p_data->>'institution_name',
+        'password', p_data->>'password'
+    ) INTO v_result;
+
+    RETURN v_result;
+END;
+$$;
+
+
+ALTER FUNCTION public.register_user(p_data jsonb) OWNER TO postgres;
+
+--
+-- TOC entry 252 (class 1255 OID 26553)
+-- Name: remove_role_permission(integer, text, text); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.remove_role_permission(p_role_id integer, p_action_name text, p_resource_name text) RETURNS TABLE(success boolean, message text, role_name text, action_name text, resource_name text, permission_deleted boolean)
+    LANGUAGE plpgsql ROWS 1
+    AS $$
+DECLARE
+    v_role_name text;
+    v_action_id integer;
+    v_resource_id integer;
+    v_permission_id integer;
+    v_rows_deleted integer;
+    v_other_role_count integer;
+    v_permission_deleted boolean := false;
+BEGIN
+    -- Check if role exists and get its name
+    SELECT name INTO v_role_name FROM roles WHERE id = p_role_id;
+    IF v_role_name IS NULL THEN
+        RETURN QUERY SELECT 
+            false::boolean AS success,
+            ('Role with ID "' || p_role_id || '" does not exist')::text AS message,
+            NULL::text AS role_name,
+            p_action_name AS action_name,
+            p_resource_name AS resource_name,
+            false::boolean AS permission_deleted;
+        RETURN;
+    END IF;
+
+    -- Check if action exists and get its ID
+    SELECT id INTO v_action_id FROM actions WHERE name = p_action_name;
+    IF v_action_id IS NULL THEN
+        RETURN QUERY SELECT 
+            false::boolean AS success,
+            ('Action "' || p_action_name || '" does not exist')::text AS message,
+            v_role_name AS role_name,
+            p_action_name AS action_name,
+            p_resource_name AS resource_name,
+            false::boolean AS permission_deleted;
+        RETURN;
+    END IF;
+
+    -- Check if resource exists and get its ID
+    SELECT id INTO v_resource_id FROM resources WHERE name = p_resource_name;
+    IF v_resource_id IS NULL THEN
+        RETURN QUERY SELECT 
+            false::boolean AS success,
+            ('Resource "' || p_resource_name || '" does not exist')::text AS message,
+            v_role_name AS role_name,
+            p_action_name AS action_name,
+            p_resource_name AS resource_name,
+            false::boolean AS permission_deleted;
+        RETURN;
+    END IF;
+
+    -- Get permission ID
+    SELECT id INTO v_permission_id 
+    FROM permissions 
+    WHERE resource_id = v_resource_id 
+    AND action_id = v_action_id;
+    
+    IF v_permission_id IS NULL THEN
+        RETURN QUERY SELECT 
+            false::boolean AS success,
+            ('Permission "' || p_action_name || ':' || p_resource_name || '" does not exist')::text AS message,
+            v_role_name AS role_name,
+            p_action_name AS action_name,
+            p_resource_name AS resource_name,
+            false::boolean AS permission_deleted;
+        RETURN;
+    END IF;
+
+    -- Delete the role-permission relationship
+    DELETE FROM role_permissions 
+    WHERE role_id = p_role_id 
+    AND permission_id = v_permission_id;
+    
+    GET DIAGNOSTICS v_rows_deleted = ROW_COUNT;
+    
+    -- Only check for orphaned permission if we actually deleted a role-permission
+    IF v_rows_deleted > 0 THEN
+        -- Check if other roles still use this permission
+        SELECT COUNT(*) INTO v_other_role_count
+        FROM role_permissions 
+        WHERE permission_id = v_permission_id;
+
+        -- Delete permission if no other roles use it
+        IF v_other_role_count = 0 THEN
+            DELETE FROM permissions WHERE id = v_permission_id;
+            v_permission_deleted := true;
+        END IF;
+
+        RETURN QUERY SELECT 
+            true::boolean AS success,
+            ('Action "' || p_action_name || '" on resource "' || p_resource_name || 
+             '" removed from role "' || v_role_name || '"' ||
+             CASE WHEN v_permission_deleted THEN ' (permission deleted as it was orphaned)' ELSE '' END)::text AS message,
+            v_role_name AS role_name,
+            p_action_name AS action_name,
+            p_resource_name AS resource_name,
+            v_permission_deleted AS permission_deleted;
+    ELSE
+        RETURN QUERY SELECT 
+            false::boolean AS success,
+            ('Action "' || p_action_name || '" on resource "' || p_resource_name || 
+             '" was not assigned to role "' || v_role_name || '"')::text AS message,
+            v_role_name AS role_name,
+            p_action_name AS action_name,
+            p_resource_name AS resource_name,
+            false::boolean AS permission_deleted;
+    END IF;
+END;
+$$;
+
+
+ALTER FUNCTION public.remove_role_permission(p_role_id integer, p_action_name text, p_resource_name text) OWNER TO postgres;
+
+--
+-- TOC entry 235 (class 1255 OID 26474)
+-- Name: update_updated_at_column(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.update_updated_at_column() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    NEW.updated_at = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION public.update_updated_at_column() OWNER TO postgres;
+
+--
+-- TOC entry 234 (class 1255 OID 25225)
+-- Name: update_users_updated_at(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.update_users_updated_at() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION public.update_users_updated_at() OWNER TO postgres;
+
+SET default_tablespace = '';
+
+SET default_table_access_method = heap;
+
+--
+-- TOC entry 224 (class 1259 OID 26479)
+-- Name: actions; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.actions (
+    id integer NOT NULL,
+    name character varying(50) NOT NULL,
+    description text,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+    updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP
+);
+
+
+ALTER TABLE public.actions OWNER TO postgres;
+
+--
+-- TOC entry 223 (class 1259 OID 26478)
+-- Name: actions_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+CREATE SEQUENCE public.actions_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE public.actions_id_seq OWNER TO postgres;
+
+--
+-- TOC entry 3935 (class 0 OID 0)
+-- Dependencies: 223
+-- Name: actions_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+--
+
+ALTER SEQUENCE public.actions_id_seq OWNED BY public.actions.id;
+
+
+--
+-- TOC entry 232 (class 1259 OID 35460)
+-- Name: offices; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.offices (
+    id integer NOT NULL,
+    insti_code character varying(10) NOT NULL,
+    insti_name character varying(100) NOT NULL,
+    branch_code character varying(20) NOT NULL,
+    branch_name character varying(100) NOT NULL,
+    branch_address character varying(255) NOT NULL,
+    unit_code character varying(10) NOT NULL,
+    unit_name character varying(50) NOT NULL,
+    center_code character varying(20) NOT NULL,
+    center_name character varying(100) NOT NULL,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+    updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP
+);
+
+
+ALTER TABLE public.offices OWNER TO postgres;
+
+--
+-- TOC entry 231 (class 1259 OID 35459)
+-- Name: offices_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+CREATE SEQUENCE public.offices_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE public.offices_id_seq OWNER TO postgres;
+
+--
+-- TOC entry 3936 (class 0 OID 0)
+-- Dependencies: 231
+-- Name: offices_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+--
+
+ALTER SEQUENCE public.offices_id_seq OWNED BY public.offices.id;
+
+
+--
+-- TOC entry 220 (class 1259 OID 26450)
+-- Name: password_reset_tokens; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.password_reset_tokens (
+    id integer NOT NULL,
+    email character varying(255) NOT NULL,
+    token character varying(255) NOT NULL,
+    expires_at timestamp without time zone NOT NULL,
+    used_at timestamp without time zone,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP
+);
+
+
+ALTER TABLE public.password_reset_tokens OWNER TO postgres;
+
+--
+-- TOC entry 219 (class 1259 OID 26449)
+-- Name: password_reset_tokens_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+CREATE SEQUENCE public.password_reset_tokens_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE public.password_reset_tokens_id_seq OWNER TO postgres;
+
+--
+-- TOC entry 3937 (class 0 OID 0)
+-- Dependencies: 219
+-- Name: password_reset_tokens_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+--
+
+ALTER SEQUENCE public.password_reset_tokens_id_seq OWNED BY public.password_reset_tokens.id;
+
+
+--
+-- TOC entry 228 (class 1259 OID 26507)
+-- Name: permissions; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.permissions (
+    id integer NOT NULL,
+    resource_id integer NOT NULL,
+    action_id integer NOT NULL,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+    updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP
+);
+
+
+ALTER TABLE public.permissions OWNER TO postgres;
+
+--
+-- TOC entry 227 (class 1259 OID 26506)
+-- Name: permissions_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+CREATE SEQUENCE public.permissions_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE public.permissions_id_seq OWNER TO postgres;
+
+--
+-- TOC entry 3938 (class 0 OID 0)
+-- Dependencies: 227
+-- Name: permissions_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+--
+
+ALTER SEQUENCE public.permissions_id_seq OWNED BY public.permissions.id;
+
+
+--
+-- TOC entry 226 (class 1259 OID 26493)
+-- Name: resources; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.resources (
+    id integer NOT NULL,
+    name character varying(100) NOT NULL,
+    description text,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+    updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP
+);
+
+
+ALTER TABLE public.resources OWNER TO postgres;
+
+--
+-- TOC entry 225 (class 1259 OID 26492)
+-- Name: resources_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+CREATE SEQUENCE public.resources_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE public.resources_id_seq OWNER TO postgres;
+
+--
+-- TOC entry 3939 (class 0 OID 0)
+-- Dependencies: 225
+-- Name: resources_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+--
+
+ALTER SEQUENCE public.resources_id_seq OWNED BY public.resources.id;
+
+
+--
+-- TOC entry 230 (class 1259 OID 26530)
+-- Name: role_permissions; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.role_permissions (
+    id integer NOT NULL,
+    role_id integer NOT NULL,
+    permission_id integer NOT NULL,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+    updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP
+);
+
+
+ALTER TABLE public.role_permissions OWNER TO postgres;
+
+--
+-- TOC entry 229 (class 1259 OID 26529)
+-- Name: role_permissions_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+CREATE SEQUENCE public.role_permissions_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE public.role_permissions_id_seq OWNER TO postgres;
+
+--
+-- TOC entry 3940 (class 0 OID 0)
+-- Dependencies: 229
+-- Name: role_permissions_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+--
+
+ALTER SEQUENCE public.role_permissions_id_seq OWNED BY public.role_permissions.id;
+
+
+--
+-- TOC entry 222 (class 1259 OID 26462)
+-- Name: roles; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.roles (
+    id integer NOT NULL,
+    name character varying(50) NOT NULL,
+    description text,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+    updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP
+);
+
+
+ALTER TABLE public.roles OWNER TO postgres;
+
+--
+-- TOC entry 221 (class 1259 OID 26461)
+-- Name: roles_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+CREATE SEQUENCE public.roles_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE public.roles_id_seq OWNER TO postgres;
+
+--
+-- TOC entry 3941 (class 0 OID 0)
+-- Dependencies: 221
+-- Name: roles_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+--
+
+ALTER SEQUENCE public.roles_id_seq OWNED BY public.roles.id;
+
+
+--
+-- TOC entry 218 (class 1259 OID 25322)
+-- Name: users; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.users (
+    id integer NOT NULL,
+    username character varying(255),
+    staff_id character varying(50) NOT NULL,
+    first_name character varying(100) NOT NULL,
+    middle_name character varying(100),
+    last_name character varying(100) NOT NULL,
+    email character varying(255),
+    phone_no character varying(20),
+    birthdate date,
+    password character varying(255),
+    institution_id integer NOT NULL,
+    institution_code character varying(50) NOT NULL,
+    institution_name character varying(255),
+    is_active boolean DEFAULT false,
+    last_login timestamp without time zone,
+    requires_password_reset boolean DEFAULT true,
+    last_password_reset timestamp without time zone,
+    created_at timestamp without time zone DEFAULT now() NOT NULL,
+    updated_at timestamp without time zone DEFAULT now() NOT NULL,
+    deleted_at timestamp without time zone,
+    role_id integer
+);
+
+
+ALTER TABLE public.users OWNER TO postgres;
+
+--
+-- TOC entry 217 (class 1259 OID 25321)
+-- Name: users_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+CREATE SEQUENCE public.users_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE public.users_id_seq OWNER TO postgres;
+
+--
+-- TOC entry 3942 (class 0 OID 0)
+-- Dependencies: 217
+-- Name: users_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+--
+
+ALTER SEQUENCE public.users_id_seq OWNED BY public.users.id;
+
+
+--
+-- TOC entry 3712 (class 2604 OID 26482)
+-- Name: actions id; Type: DEFAULT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.actions ALTER COLUMN id SET DEFAULT nextval('public.actions_id_seq'::regclass);
+
+
+--
+-- TOC entry 3724 (class 2604 OID 35463)
+-- Name: offices id; Type: DEFAULT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.offices ALTER COLUMN id SET DEFAULT nextval('public.offices_id_seq'::regclass);
+
+
+--
+-- TOC entry 3707 (class 2604 OID 26453)
+-- Name: password_reset_tokens id; Type: DEFAULT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.password_reset_tokens ALTER COLUMN id SET DEFAULT nextval('public.password_reset_tokens_id_seq'::regclass);
+
+
+--
+-- TOC entry 3718 (class 2604 OID 26510)
+-- Name: permissions id; Type: DEFAULT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.permissions ALTER COLUMN id SET DEFAULT nextval('public.permissions_id_seq'::regclass);
+
+
+--
+-- TOC entry 3715 (class 2604 OID 26496)
+-- Name: resources id; Type: DEFAULT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.resources ALTER COLUMN id SET DEFAULT nextval('public.resources_id_seq'::regclass);
+
+
+--
+-- TOC entry 3721 (class 2604 OID 26533)
+-- Name: role_permissions id; Type: DEFAULT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.role_permissions ALTER COLUMN id SET DEFAULT nextval('public.role_permissions_id_seq'::regclass);
+
+
+--
+-- TOC entry 3709 (class 2604 OID 26465)
+-- Name: roles id; Type: DEFAULT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.roles ALTER COLUMN id SET DEFAULT nextval('public.roles_id_seq'::regclass);
+
+
+--
+-- TOC entry 3702 (class 2604 OID 25325)
+-- Name: users id; Type: DEFAULT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.users ALTER COLUMN id SET DEFAULT nextval('public.users_id_seq'::regclass);
+
+
+--
+-- TOC entry 3921 (class 0 OID 26479)
+-- Dependencies: 224
+-- Data for Name: actions; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.actions (id, name, description, created_at, updated_at) FROM stdin;
+1	create	\N	2025-12-02 02:25:07.955896	2025-12-05 10:33:43.194985
+2	view	permission to view records	2025-12-05 10:30:51.620374	2025-12-05 10:30:51.620374
+3	update	Permission to modify or edit existing records/entries	2025-12-02 02:25:07.955896	2025-12-02 02:25:07.955896
+4	delete	Permission to remove or delete records/entries	2025-12-02 02:25:07.955896	2025-12-02 02:25:07.955896
+\.
+
+
+--
+-- TOC entry 3929 (class 0 OID 35460)
+-- Dependencies: 232
+-- Data for Name: offices; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.offices (id, insti_code, insti_name, branch_code, branch_name, branch_address, unit_code, unit_name, center_code, center_name, created_at, updated_at) FROM stdin;
+1	2546	Card Bank Inc.	PH1030001	Main Branch	Sta. Cruz, Laguna	SCO00	MAIN	CO072011	PANGLAN 1A	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+2	2546	Card Bank Inc.	PH1030001	Main Branch	Sta. Cruz, Laguna	SCO01	RETAIL	CO072012	PANGIL 2A	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+3	2546	Card Bank Inc.	PH1030001	Main Branch	Sta. Cruz, Laguna	SCO02	CORPORATE	CO072013	BUKAL 1A	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+4	2546	Card Bank Inc.	PH1030002	Makati Branch	Ayala Avenue, Makati City	MAK00	MAIN	CO072101	MAKATI CENTRAL	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+5	2546	Card Bank Inc.	PH1030002	Makati Branch	Ayala Avenue, Makati City	MAK01	BUSINESS	CO072102	SALCEDO VILLAGE	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+6	2546	Card Bank Inc.	PH1030002	Makati Branch	Ayala Avenue, Makati City	MAK02	PRIVATE	CO072103	LEGASPI VILLAGE	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+7	2546	Card Bank Inc.	PH1030003	Quezon City Branch	Eastwood City, Quezon City	QC000	MAIN	CO072201	EASTWOOD CENTER	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+8	2546	Card Bank Inc.	PH1030003	Quezon City Branch	Eastwood City, Quezon City	QC001	RETAIL	CO072202	CUBAO BRANCH	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+9	2546	Card Bank Inc.	PH1030003	Quezon City Branch	Eastwood City, Quezon City	QC002	COMMERCIAL	CO072203	TIMOG AVENUE	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+10	2546	Card Bank Inc.	PH1030004	Cebu Branch	Cebu Business Park, Cebu City	CEB00	MAIN	CO072301	CEBU CENTRAL	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+11	2546	Card Bank Inc.	PH1030004	Cebu Branch	Cebu Business Park, Cebu City	CEB01	PORT	CO072302	MANDAUE CITY	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+12	2546	Card Bank Inc.	PH1030004	Cebu Branch	Cebu Business Park, Cebu City	CEB02	MARITIME	CO072303	LAPU-LAPU	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+13	2546	Card Bank Inc.	PH1030005	Davao Branch	Davao City Proper, Davao	DVO00	MAIN	CO072401	DAVAO CENTRAL	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+14	2546	Card Bank Inc.	PH1030005	Davao Branch	Davao City Proper, Davao	DVO01	AGRI	CO072402	BUKIDNON AGRI	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+15	2546	Card Bank Inc.	PH1030005	Davao Branch	Davao City Proper, Davao	DVO02	EXPORT	CO072403	MATINA EXPORT	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+16	2546	Card Bank Inc.	PH1030006	Baguio Branch	Session Road, Baguio City	BAG00	MAIN	CO072501	BAGUIO CENTRAL	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+17	2546	Card Bank Inc.	PH1030006	Baguio Branch	Session Road, Baguio City	BAG01	TOURISM	CO072502	BURNHAM PARK	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+18	2546	Card Bank Inc.	PH1030006	Baguio Branch	Session Road, Baguio City	BAG02	HIGHLAND	CO072503	LA TRINIDAD	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+19	2546	Card Bank Inc.	PH1030007	Iloilo Branch	Iloilo Business Park, Iloilo City	ILO00	MAIN	CO072601	ILOILO CENTRAL	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+20	2546	Card Bank Inc.	PH1030007	Iloilo Branch	Iloilo Business Park, Iloilo City	ILO01	RURAL	CO072602	GUIMARAS RURAL	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+21	2546	Card Bank Inc.	PH1030007	Iloilo Branch	Iloilo Business Park, Iloilo City	ILO02	COMMERCE	CO072603	MANDURIAO	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+22	2546	Card Bank Inc.	PH1030008	Bacolod Branch	Lacson Street, Bacolod City	BCD00	MAIN	CO072701	BACOLOD CENTRAL	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+23	2546	Card Bank Inc.	PH1030008	Bacolod Branch	Lacson Street, Bacolod City	BCD01	SUGAR	CO072702	TALISAY SUGAR	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+24	2546	Card Bank Inc.	PH1030008	Bacolod Branch	Lacson Street, Bacolod City	BCD02	INDUSTRIAL	CO072703	SILAY INDUSTRIAL	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+25	2546	Card Bank Inc.	PH1030009	Cagayan de Oro Branch	Divisoria, Cagayan de Oro	CDO00	MAIN	CO072801	CDO CENTRAL	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+26	2546	Card Bank Inc.	PH1030009	Cagayan de Oro Branch	Divisoria, Cagayan de Oro	CDO01	RIVER	CO072802	CAGAYAN RIVER	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+27	2546	Card Bank Inc.	PH1030009	Cagayan de Oro Branch	Divisoria, Cagayan de Oro	CDO02	NORTHERN	CO072803	OPOL NORTHERN	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+28	2546	Card Bank Inc.	PH1030010	Angeles Branch	Fields Avenue, Angeles City	ANG00	MAIN	CO072901	ANGELES CENTRAL	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+29	2546	Card Bank Inc.	PH1030010	Angeles Branch	Fields Avenue, Angeles City	ANG01	TOURISM	CO072902	CLARK TOURISM	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+30	2546	Card Bank Inc.	PH1030010	Angeles Branch	Fields Avenue, Angeles City	ANG02	INTERNATIONAL	CO072903	MABALACAT INT	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+31	2546	Card Bank Inc.	PH1030001	Main Branch	Sta. Cruz, Laguna	SCO00	MAIN	CO072015	OOBI 1A	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+32	2546	Card Bank Inc.	PH1030001	Main Branch	Sta. Cruz, Laguna	SCO00	MAIN	CO072016	SAN MIGUEL 1A	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+33	2546	Card Bank Inc.	PH1030001	Main Branch	Sta. Cruz, Laguna	SCO00	MAIN	CO072017	SAN MIGUEL 4A	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+34	2546	Card Bank Inc.	PH1030001	Main Branch	Sta. Cruz, Laguna	SCO00	MAIN	CO072018	ORIGUEL 3A	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+35	2546	Card Bank Inc.	PH1030001	Main Branch	Sta. Cruz, Laguna	SCO00	MAIN	CO072019	OLLA 1A	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+36	2546	Card Bank Inc.	PH1030001	Main Branch	Sta. Cruz, Laguna	SCO00	MAIN	CO072020	OLLA 3A	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+37	2546	Card Bank Inc.	PH1030001	Main Branch	Sta. Cruz, Laguna	SCO00	MAIN	CO072021	OLLA 4A	2026-01-20 13:56:31.496495	2026-01-20 13:56:31.496495
+\.
+
+
+--
+-- TOC entry 3917 (class 0 OID 26450)
+-- Dependencies: 220
+-- Data for Name: password_reset_tokens; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.password_reset_tokens (id, email, token, expires_at, used_at, created_at) FROM stdin;
+1	jemuel.salcedo@cardmri.com	911a95231e09936934261f98bf045a7191aed0b88f907f82be571a266edcdae4	2025-12-22 15:46:35	\N	2025-12-22 15:41:35.132978
+\.
+
+
+--
+-- TOC entry 3925 (class 0 OID 26507)
+-- Dependencies: 228
+-- Data for Name: permissions; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.permissions (id, resource_id, action_id, created_at, updated_at) FROM stdin;
+4	1	1	2025-12-29 14:42:14.529525	2025-12-29 14:42:14.529525
+\.
+
+
+--
+-- TOC entry 3923 (class 0 OID 26493)
+-- Dependencies: 226
+-- Data for Name: resources; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.resources (id, name, description, created_at, updated_at) FROM stdin;
+1	exam	\N	2025-12-04 15:46:30.97302	2025-12-05 02:06:12.42466
+2	test	\N	2025-12-05 08:18:15.683782	2025-12-05 08:18:15.683782
+3	roles		2025-12-05 10:36:37.828696	2025-12-29 13:18:25.203468
+\.
+
+
+--
+-- TOC entry 3927 (class 0 OID 26530)
+-- Dependencies: 230
+-- Data for Name: role_permissions; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.role_permissions (id, role_id, permission_id, created_at, updated_at) FROM stdin;
+4	4	4	2025-12-29 14:42:14.529525	2025-12-29 14:42:14.529525
+\.
+
+
+--
+-- TOC entry 3919 (class 0 OID 26462)
+-- Dependencies: 222
+-- Data for Name: roles; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.roles (id, name, description, created_at, updated_at) FROM stdin;
+1	super_admin	Highest privilege access; can manage all system modules	2025-12-02 01:41:32.886589	2025-12-02 01:41:32.886589
+2	admin	Administrative access for user and system management	2025-12-02 01:41:32.886589	2025-12-02 01:41:32.886589
+3	head	Department or unit head with elevated permissions	2025-12-02 01:41:32.886589	2025-12-02 01:41:32.886589
+4	dev	Developer role for technical operations and debugging	2025-12-02 01:41:32.886589	2025-12-02 01:41:32.886589
+5	ts	Technical Support role for assisting system users	2025-12-02 01:41:32.886589	2025-12-02 01:41:32.886589
+6	qa	Quality Assurance role responsible for testing and verification	2025-12-02 01:41:32.886589	2025-12-02 01:41:32.886589
+7	ps	Product Specialist role with feature-level access	2025-12-02 01:41:32.886589	2025-12-02 01:41:32.886589
+\.
+
+
+--
+-- TOC entry 3915 (class 0 OID 25322)
+-- Dependencies: 218
+-- Data for Name: users; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.users (id, username, staff_id, first_name, middle_name, last_name, email, phone_no, birthdate, password, institution_id, institution_code, institution_name, is_active, last_login, requires_password_reset, last_password_reset, created_at, updated_at, deleted_at, role_id) FROM stdin;
+10	202510-57284	202510-57284	Jemuel	Rapa	Salcedo	jemuel.salcedo@cardmri.com	09683849899	2002-11-06	n3w_P@ssw0rdS	26	9869	Bakawan Data Analytics, Inc.	t	2026-01-20 14:46:15.182693	f	2025-12-29 13:14:33.575511	2025-12-29 13:14:12.007948	2026-01-20 14:46:15.182693	\N	1
+11	202508-55826	202508-55826	Artemio III	Esperanzate	Lorredo	artem.lorredoiii@cardmri.com	09455781374	2002-11-06	T3mpP@ssw0rd-BMIRuwt	26	9869	Bakawan Data Analytics, Inc.	f	\N	t	\N	2025-12-29 13:20:23.118692	2026-01-20 15:13:54.092789	\N	4
+\.
+
+
+--
+-- TOC entry 3943 (class 0 OID 0)
+-- Dependencies: 223
+-- Name: actions_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
+--
+
+SELECT pg_catalog.setval('public.actions_id_seq', 5, true);
+
+
+--
+-- TOC entry 3944 (class 0 OID 0)
+-- Dependencies: 231
+-- Name: offices_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
+--
+
+SELECT pg_catalog.setval('public.offices_id_seq', 37, true);
+
+
+--
+-- TOC entry 3945 (class 0 OID 0)
+-- Dependencies: 219
+-- Name: password_reset_tokens_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
+--
+
+SELECT pg_catalog.setval('public.password_reset_tokens_id_seq', 1, true);
+
+
+--
+-- TOC entry 3946 (class 0 OID 0)
+-- Dependencies: 227
+-- Name: permissions_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
+--
+
+SELECT pg_catalog.setval('public.permissions_id_seq', 4, true);
+
+
+--
+-- TOC entry 3947 (class 0 OID 0)
+-- Dependencies: 225
+-- Name: resources_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
+--
+
+SELECT pg_catalog.setval('public.resources_id_seq', 3, true);
+
+
+--
+-- TOC entry 3948 (class 0 OID 0)
+-- Dependencies: 229
+-- Name: role_permissions_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
+--
+
+SELECT pg_catalog.setval('public.role_permissions_id_seq', 4, true);
+
+
+--
+-- TOC entry 3949 (class 0 OID 0)
+-- Dependencies: 221
+-- Name: roles_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
+--
+
+SELECT pg_catalog.setval('public.roles_id_seq', 7, true);
+
+
+--
+-- TOC entry 3950 (class 0 OID 0)
+-- Dependencies: 217
+-- Name: users_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
+--
+
+SELECT pg_catalog.setval('public.users_id_seq', 11, true);
+
+
+--
+-- TOC entry 3738 (class 2606 OID 26490)
+-- Name: actions actions_name_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.actions
+    ADD CONSTRAINT actions_name_key UNIQUE (name);
+
+
+--
+-- TOC entry 3740 (class 2606 OID 26488)
+-- Name: actions actions_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.actions
+    ADD CONSTRAINT actions_pkey PRIMARY KEY (id);
+
+
+--
+-- TOC entry 3754 (class 2606 OID 35471)
+-- Name: offices offices_center_code_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.offices
+    ADD CONSTRAINT offices_center_code_key UNIQUE (center_code);
+
+
+--
+-- TOC entry 3756 (class 2606 OID 35469)
+-- Name: offices offices_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.offices
+    ADD CONSTRAINT offices_pkey PRIMARY KEY (id);
+
+
+--
+-- TOC entry 3730 (class 2606 OID 26458)
+-- Name: password_reset_tokens password_reset_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.password_reset_tokens
+    ADD CONSTRAINT password_reset_tokens_pkey PRIMARY KEY (id);
+
+
+--
+-- TOC entry 3732 (class 2606 OID 26460)
+-- Name: password_reset_tokens password_reset_tokens_token_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.password_reset_tokens
+    ADD CONSTRAINT password_reset_tokens_token_key UNIQUE (token);
+
+
+--
+-- TOC entry 3746 (class 2606 OID 26514)
+-- Name: permissions permissions_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.permissions
+    ADD CONSTRAINT permissions_pkey PRIMARY KEY (id);
+
+
+--
+-- TOC entry 3742 (class 2606 OID 26504)
+-- Name: resources resources_name_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.resources
+    ADD CONSTRAINT resources_name_key UNIQUE (name);
+
+
+--
+-- TOC entry 3744 (class 2606 OID 26502)
+-- Name: resources resources_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.resources
+    ADD CONSTRAINT resources_pkey PRIMARY KEY (id);
+
+
+--
+-- TOC entry 3750 (class 2606 OID 26537)
+-- Name: role_permissions role_permissions_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.role_permissions
+    ADD CONSTRAINT role_permissions_pkey PRIMARY KEY (id);
+
+
+--
+-- TOC entry 3734 (class 2606 OID 26473)
+-- Name: roles roles_name_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.roles
+    ADD CONSTRAINT roles_name_key UNIQUE (name);
+
+
+--
+-- TOC entry 3736 (class 2606 OID 26471)
+-- Name: roles roles_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.roles
+    ADD CONSTRAINT roles_pkey PRIMARY KEY (id);
+
+
+--
+-- TOC entry 3748 (class 2606 OID 26516)
+-- Name: permissions unique_resource_action; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.permissions
+    ADD CONSTRAINT unique_resource_action UNIQUE (resource_id, action_id);
+
+
+--
+-- TOC entry 3752 (class 2606 OID 26539)
+-- Name: role_permissions unique_role_permission; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.role_permissions
+    ADD CONSTRAINT unique_role_permission UNIQUE (role_id, permission_id);
+
+
+--
+-- TOC entry 3728 (class 2606 OID 25333)
+-- Name: users users_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.users
+    ADD CONSTRAINT users_pkey PRIMARY KEY (id);
+
+
+--
+-- TOC entry 3764 (class 2620 OID 26491)
+-- Name: actions update_actions_updated_at; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER update_actions_updated_at BEFORE UPDATE ON public.actions FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+
+--
+-- TOC entry 3768 (class 2620 OID 35472)
+-- Name: offices update_offices_updated_at; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER update_offices_updated_at BEFORE UPDATE ON public.offices FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+
+--
+-- TOC entry 3766 (class 2620 OID 26527)
+-- Name: permissions update_permissions_updated_at; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER update_permissions_updated_at BEFORE UPDATE ON public.permissions FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+
+--
+-- TOC entry 3765 (class 2620 OID 26505)
+-- Name: resources update_resources_updated_at; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER update_resources_updated_at BEFORE UPDATE ON public.resources FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+
+--
+-- TOC entry 3767 (class 2620 OID 26550)
+-- Name: role_permissions update_role_permissions_updated_at; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER update_role_permissions_updated_at BEFORE UPDATE ON public.role_permissions FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+
+--
+-- TOC entry 3763 (class 2620 OID 26475)
+-- Name: roles update_roles_updated_at; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER update_roles_updated_at BEFORE UPDATE ON public.roles FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+
+--
+-- TOC entry 3762 (class 2620 OID 25334)
+-- Name: users users_updated_at_trigger; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER users_updated_at_trigger BEFORE UPDATE ON public.users FOR EACH ROW EXECUTE FUNCTION public.update_users_updated_at();
+
+
+--
+-- TOC entry 3758 (class 2606 OID 26522)
+-- Name: permissions fk_permissions_action; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.permissions
+    ADD CONSTRAINT fk_permissions_action FOREIGN KEY (action_id) REFERENCES public.actions(id);
+
+
+--
+-- TOC entry 3759 (class 2606 OID 26517)
+-- Name: permissions fk_permissions_resource; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.permissions
+    ADD CONSTRAINT fk_permissions_resource FOREIGN KEY (resource_id) REFERENCES public.resources(id);
+
+
+--
+-- TOC entry 3760 (class 2606 OID 26545)
+-- Name: role_permissions fk_role_permissions_permission; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.role_permissions
+    ADD CONSTRAINT fk_role_permissions_permission FOREIGN KEY (permission_id) REFERENCES public.permissions(id);
+
+
+--
+-- TOC entry 3761 (class 2606 OID 26540)
+-- Name: role_permissions fk_role_permissions_role; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.role_permissions
+    ADD CONSTRAINT fk_role_permissions_role FOREIGN KEY (role_id) REFERENCES public.roles(id);
+
+
+--
+-- TOC entry 3757 (class 2606 OID 26556)
+-- Name: users fk_users_role; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.users
+    ADD CONSTRAINT fk_users_role FOREIGN KEY (role_id) REFERENCES public.roles(id) ON DELETE SET NULL;
+
+
+-- Completed on 2026-01-21 09:06:17 PST
+
+--
+-- PostgreSQL database dump complete
+--
+
